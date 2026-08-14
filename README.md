@@ -1,5 +1,7 @@
 # go-agc
-A pure-Go reader for Assembled Genomes Compressor (AGC) v3 archives
+
+A pure-Go reader for [Assembled Genomes Compressor (AGC)](https://github.com/refresh-bio/agc)
+v3 archives.
 
 The read-only library opens local files or arbitrary `io.ReaderAt` backends,
 validates file-format major version 3, lists samples and contigs, retrieves
