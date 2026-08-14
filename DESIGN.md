@@ -43,7 +43,7 @@ The footer is parsed into a small immutable stream/part index. Parts are fetched
 
 1. **Open and identify — complete.** Parse and validate the footer, load `file_type_info`, reject non-v3 archives, lazily decode `collection-samples`, expose open/close, samples, and reference sample. Add toy-archive behavior tests, corruption cases, CLI cross-check, and open/list benchmarks.
 2. **Contig catalogue — complete.** Decode v3 contig-name batches on demand; expose `Contigs`; test delta-encoded names, batch boundaries, duplicate names across samples, and corrupt zstd/collection data.
-3. **Sequence primitives.** Port v3 segment-group reference/delta decoding, DNA symbol conversion, reverse complement, and overlap assembly. Test generated fixtures against reference AGC output.
-4. **Retrieval.** Expose `Contig`, retaining full stored header while matching the upstream short-name rules explicitly. Add missing/ambiguous-name behavior and corruption coverage.
-5. **Streaming iteration.** Add one-sample and all-sample callback iteration with bounded working memory and deterministic archive order.
-6. **Hardening and performance.** Expand malformed-input/fuzz coverage, enforce allocation limits, race-test concurrent reads, and benchmark metadata, random contig lookup, and full traversal.
+3. **Sequence primitives — complete.** Port v3 segment-group reference/delta decoding, DNA symbol conversion, reverse complement, and overlap assembly. Test generated fixtures against reference AGC output.
+4. **Retrieval — complete.** Expose `Contig`, retaining full stored header while matching the upstream short-name rules explicitly. Add missing-name behavior and corruption coverage.
+5. **Streaming iteration — complete.** Add one-sample and all-sample callback iteration with bounded working memory and deterministic archive order.
+6. **Hardening and performance — complete for the initial reader.** Expand malformed-input/fuzz coverage, enforce allocation limits, race-test concurrent reads, and benchmark metadata, random contig lookup, and full traversal.

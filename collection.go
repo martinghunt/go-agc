@@ -15,8 +15,17 @@ import (
 const (
 	maxSampleMetadataSize = 256 << 20
 	maxContigBatchSize    = 1 << 30
+	maxDetailsBatchSize   = 256 << 20
 	maxParamsSize         = 64
+	maxSegmentsPerBatch   = 1 << 24
 )
+
+type segmentDescriptor struct {
+	groupID   uint32
+	inGroupID uint32
+	reversed  bool
+	rawLength uint32
+}
 
 // Samples returns samples in archive order. The reference sample is first.
 func (a *Archive) Samples() ([]Sample, error) {
@@ -149,6 +158,12 @@ func (a *Archive) loadParams() error {
 		return fmt.Errorf("%w: invalid sample batch cardinality %d", ErrCorruptArchive, batchSize)
 	}
 	a.batchSize = batchSize
+	a.kmerLength = binary.LittleEndian.Uint32(data[0:4])
+	a.minMatchLen = binary.LittleEndian.Uint32(data[4:8])
+	a.segmentSize = binary.LittleEndian.Uint32(data[12:16])
+	if a.minMatchLen == 0 || uint64(a.segmentSize)+uint64(a.kmerLength) > uint64(^uint32(0)) {
+		return fmt.Errorf("%w: invalid compression parameters", ErrCorruptArchive)
+	}
 	a.paramsLoaded = true
 	return nil
 }
@@ -205,7 +220,152 @@ func (a *Archive) loadContigBatch(batchID int) error {
 	}
 	a.contigBatch = batch
 	a.contigBatchID = batchID
+	a.contigDetails = nil
+	a.detailsBatchID = -1
 	return nil
+}
+
+func (a *Archive) loadContigDetails(batchID int) error {
+	if a.detailsBatchID == batchID {
+		return nil
+	}
+	if a.contigBatchID != batchID {
+		if err := a.loadContigBatch(batchID); err != nil {
+			return err
+		}
+	}
+	part, err := a.index.part("collection-details", batchID)
+	if err != nil {
+		return err
+	}
+	stream, _, err := readPart(a.r, a.index.dataEnd, part, maxDetailsBatchSize)
+	if err != nil {
+		return fmt.Errorf("collection-details part %d: %w", batchID, err)
+	}
+	c := byteCursor{data: stream}
+	type blockSize struct{ raw, packed uint32 }
+	var sizes [5]blockSize
+	var totalPacked uint64
+	for i := range sizes {
+		sizes[i].raw, err = c.collectionUint()
+		if err != nil {
+			return fmt.Errorf("%w: invalid collection-details size header", ErrCorruptArchive)
+		}
+		sizes[i].packed, err = c.collectionUint()
+		totalPacked += uint64(sizes[i].packed)
+		if err != nil || totalPacked > uint64(c.remaining()) {
+			return fmt.Errorf("%w: invalid collection-details packed sizes", ErrCorruptArchive)
+		}
+	}
+	if totalPacked != uint64(c.remaining()) {
+		return fmt.Errorf("%w: collection-details packed sizes do not fill part", ErrCorruptArchive)
+	}
+	var blocks [5][]byte
+	for i, size := range sizes {
+		packed := c.data[c.pos : c.pos+int(size.packed)]
+		c.pos += int(size.packed)
+		if size.raw == 0 {
+			return fmt.Errorf("%w: empty collection-details block %d", ErrCorruptArchive, i)
+		}
+		blocks[i], err = decodeZstdBlock(packed, uint64(size.raw), maxDetailsBatchSize)
+		if err != nil {
+			return fmt.Errorf("collection-details block %d: %w", i, err)
+		}
+	}
+
+	shape := byteCursor{data: blocks[0]}
+	sampleCount, err := shape.collectionUint()
+	if err != nil || int(sampleCount) != len(a.contigBatch) {
+		return fmt.Errorf("%w: collection-details sample count %d, want %d", ErrCorruptArchive, sampleCount, len(a.contigBatch))
+	}
+	details := make([][][]segmentDescriptor, len(a.contigBatch))
+	var segmentCount64 uint64
+	for i := range details {
+		contigCount, err := shape.collectionUint()
+		if err != nil || int(contigCount) != len(a.contigBatch[i]) {
+			return fmt.Errorf("%w: collection-details contig count mismatch", ErrCorruptArchive)
+		}
+		details[i] = make([][]segmentDescriptor, int(contigCount))
+		for j := range details[i] {
+			count, err := shape.collectionUint()
+			segmentCount64 += uint64(count)
+			if err != nil || count == 0 || segmentCount64 > maxSegmentsPerBatch {
+				return fmt.Errorf("%w: invalid segment count in details batch", ErrCorruptArchive)
+			}
+			details[i][j] = make([]segmentDescriptor, int(count))
+		}
+	}
+	if !shape.empty() {
+		return fmt.Errorf("%w: trailing collection-details shape data", ErrCorruptArchive)
+	}
+	segmentCount := int(segmentCount64)
+
+	values := make([][]uint32, 5)
+	for blockID := 1; blockID < 5; blockID++ {
+		cursor := byteCursor{data: blocks[blockID]}
+		values[blockID] = make([]uint32, segmentCount)
+		for i := range values[blockID] {
+			values[blockID][i], err = cursor.collectionUint()
+			if err != nil {
+				return fmt.Errorf("%w: truncated collection-details block %d", ErrCorruptArchive, blockID)
+			}
+		}
+		if !cursor.empty() {
+			return fmt.Errorf("%w: trailing collection-details block %d", ErrCorruptArchive, blockID)
+		}
+	}
+
+	previousIDs := make(map[uint32]int64)
+	predictedLength := uint64(a.segmentSize) + uint64(a.kmerLength)
+	item := 0
+	for i := range details {
+		for j := range details[i] {
+			for k := range details[i][j] {
+				groupID := values[1][item]
+				previous, exists := previousIDs[groupID]
+				if !exists {
+					previous = -1
+				}
+				encodedID := values[2][item]
+				var inGroupID uint64
+				switch {
+				case previous == -1:
+					inGroupID = uint64(encodedID)
+				case encodedID == 0:
+					inGroupID = 0
+				case encodedID == 1:
+					inGroupID = uint64(previous + 1)
+				default:
+					inGroupID = zigzagDecodeRelative(uint64(encodedID-1), uint64(previous+1))
+				}
+				rawLength := zigzagDecodeRelative(uint64(values[3][item]), predictedLength)
+				if inGroupID > uint64(^uint32(0)) || rawLength > uint64(^uint32(0)) || values[4][item] > 1 {
+					return fmt.Errorf("%w: invalid segment descriptor", ErrCorruptArchive)
+				}
+				details[i][j][k] = segmentDescriptor{
+					groupID: groupID, inGroupID: uint32(inGroupID),
+					reversed: values[4][item] != 0, rawLength: uint32(rawLength),
+				}
+				if int64(inGroupID) > previous && inGroupID > 0 {
+					previousIDs[groupID] = int64(inGroupID)
+				}
+				item++
+			}
+		}
+	}
+	a.contigDetails = details
+	a.detailsBatchID = batchID
+	return nil
+}
+
+func zigzagDecodeRelative(value, previous uint64) uint64 {
+	if value >= 2*previous {
+		return value
+	}
+	if value&1 != 0 {
+		return (2*previous - value) / 2
+	}
+	return (value + 2*previous) / 2
 }
 
 func decodeContigName(previous []string, encoded string) (string, []string, error) {
@@ -245,11 +405,7 @@ func decodeZstdBlock(packed []byte, rawSize, maxSize uint64) ([]byte, error) {
 	if rawSize == 0 || rawSize > maxSize {
 		return nil, fmt.Errorf("%w: invalid decoded size %d", ErrCorruptArchive, rawSize)
 	}
-	decoder, err := zstd.NewReader(nil,
-		zstd.WithDecoderConcurrency(1),
-		zstd.WithDecoderMaxMemory(maxSize),
-		zstd.WithDecodeAllCapLimit(true),
-	)
+	decoder, err := newBoundedZstdDecoder(maxSize)
 	if err != nil {
 		return nil, fmt.Errorf("agc: initialize zstd decoder: %w", err)
 	}
@@ -262,4 +418,12 @@ func decodeZstdBlock(packed []byte, rawSize, maxSize uint64) ([]byte, error) {
 		return nil, fmt.Errorf("%w: decoded size %d, want %d", ErrCorruptArchive, len(raw), rawSize)
 	}
 	return raw, nil
+}
+
+func newBoundedZstdDecoder(maxSize uint64) (*zstd.Decoder, error) {
+	return zstd.NewReader(nil,
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderMaxMemory(maxSize),
+		zstd.WithDecodeAllCapLimit(true),
+	)
 }

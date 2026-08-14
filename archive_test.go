@@ -267,6 +267,177 @@ func TestArchive_GivenCorruptContigNameDelta_WhenListingContigs_ThenRejectsIt(t 
 	}
 }
 
+func TestArchive_GivenUpstreamToyArchive_WhenRetrievingNamedContigs_ThenDecodesSequences(t *testing.T) {
+	data := toyArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		sample   string
+		name     string
+		fullName string
+		sequence string
+	}{
+		{"ref", "chr1", "chr1", "AGCTAGCTAGCTAGCT"},
+		{"ref", "chr2", "chr2", "TAAAAAAAAAAATTT"},
+		{"ref", "chr3", "chr3", "TGGGGGGGGGGTTT"},
+		{"ref", "seq", "seq", "TGTGTGTGTG"},
+		{"a", "chr1a", "chr1a", "CTGAGCTGACTGA"},
+		{"a", "chr3a", "chr3a", "AGTTTAGCT"},
+		{"b", "chr1", "chr1", "AAAAAAAAA"},
+		{"b", "g", "g h i 21", "GGGAGGG"},
+		{"b", "c", "c", "CCCCCCCCC"},
+		{"b", "t", "t", "TTTTTTT"},
+		{"c", "1", "1", "TGTGTGTGTGTG"},
+		{"c", "2", "2", "ACACACACA"},
+		{"c", "3", "3", "TTTTCCCGGGAAAAAA"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.sample+"/"+tt.name, func(t *testing.T) {
+			contig, err := a.Contig(agc.Sample{Name: tt.sample}, tt.name)
+			if err != nil {
+				t.Fatalf("Contig() error = %v", err)
+			}
+			if contig.Sample.Name != tt.sample || contig.Name != tt.fullName || string(contig.Sequence) != tt.sequence {
+				t.Errorf("Contig() = sample %q, name %q, sequence %q; want %q, %q, %q",
+					contig.Sample.Name, contig.Name, contig.Sequence, tt.sample, tt.fullName, tt.sequence)
+			}
+		})
+	}
+}
+
+func TestArchive_GivenMissingContig_WhenRetrieving_ThenReturnsTypedError(t *testing.T) {
+	data := toyArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Contig(agc.Sample{Name: "ref"}, "missing"); !errors.Is(err, agc.ErrContigNotFound) {
+		t.Fatalf("Contig() error = %v, want ErrContigNotFound", err)
+	}
+}
+
+func TestArchive_GivenSample_WhenIterating_ThenYieldsContigsInArchiveOrder(t *testing.T) {
+	data := toyArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	err = a.IterateSample(agc.Sample{Name: "b"}, func(contig agc.Contig) error {
+		got = append(got, contig.Sample.Name+"/"+contig.Name+"="+string(contig.Sequence))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"b/chr1=AAAAAAAAA", "b/g h i 21=GGGAGGG", "b/c=CCCCCCCCC", "b/t=TTTTTTT"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("IterateSample() = %#v, want %#v", got, want)
+	}
+}
+
+func TestArchive_GivenAllSamples_WhenIterating_ThenYieldsArchiveOrderAndCanStop(t *testing.T) {
+	data := toyArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	err = a.IterateAll(func(contig agc.Contig) error {
+		got = append(got, contig.Sample.Name+"/"+contig.Name)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("IterateAll() error = %v", err)
+	}
+	want := []string{
+		"ref/chr1", "ref/chr2", "ref/chr3", "ref/seq",
+		"a/chr1a", "a/chr3a",
+		"b/chr1", "b/g h i 21", "b/c", "b/t",
+		"c/1", "c/2", "c/3",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("IterateAll() = %#v, want %#v", got, want)
+	}
+
+	stop := errors.New("stop iteration")
+	count := 0
+	err = a.IterateAll(func(agc.Contig) error {
+		count++
+		if count == 5 {
+			return stop
+		}
+		return nil
+	})
+	if !errors.Is(err, stop) || count != 5 {
+		t.Fatalf("early IterateAll() = count %d, error %v; want 5 and stop error", count, err)
+	}
+}
+
+func TestArchive_GivenConcurrentReaders_WhenRetrievingContigs_ThenResultsRemainIndependent(t *testing.T) {
+	data := toyArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]string{"chr1": "AGCTAGCTAGCTAGCT", "chr2": "TAAAAAAAAAAATTT", "chr3": "TGGGGGGGGGGTTT", "seq": "TGTGTGTGTG"}
+	for name, want := range tests {
+		name, want := name, want
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			contig, err := a.Contig(agc.Sample{Name: "ref"}, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(contig.Sequence) != want {
+				t.Errorf("sequence = %q, want %q", contig.Sequence, want)
+			}
+		})
+	}
+}
+
+func TestArchive_GivenReferenceGeneratedV3Fixture_WhenRetrieving_ThenMatchesInput(t *testing.T) {
+	agcExe := referenceAGC(t)
+	tmp := t.TempDir()
+	refSequence := strings.Repeat("ACGT", 70) + "NNNN" + strings.Repeat("TGCA", 30)
+	sampleSequence := refSequence[:145] + "TTTT" + refSequence[149:]
+	refPath := filepath.Join(tmp, "generated-ref.fa")
+	samplePath := filepath.Join(tmp, "generated-sample.fa")
+	if err := os.WriteFile(refPath, []byte(">ref-contig description\n"+refSequence+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(samplePath, []byte(">sample-contig description\n"+sampleSequence+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	archivePath := filepath.Join(tmp, "generated.agc")
+	if out, err := exec.Command(agcExe, "create", "-b", "1", "-k", "17", "-l", "15", "-s", "100", "-t", "1", "-o", archivePath, refPath, samplePath).CombinedOutput(); err != nil {
+		t.Fatalf("reference agc create: %v\n%s", err, out)
+	}
+
+	a, err := agc.Open(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	tests := []struct {
+		sample, query, fullName, sequence string
+	}{
+		{"generated-ref", "ref-contig", "ref-contig description", refSequence},
+		{"generated-sample", "sample-contig", "sample-contig description", sampleSequence},
+	}
+	for _, tt := range tests {
+		contig, err := a.Contig(agc.Sample{Name: tt.sample}, tt.query)
+		if err != nil {
+			t.Fatalf("Contig(%q, %q): %v", tt.sample, tt.query, err)
+		}
+		if contig.Name != tt.fullName || string(contig.Sequence) != tt.sequence {
+			t.Errorf("generated contig %s differs from input", tt.query)
+		}
+	}
+}
+
 func TestArchive_GivenReferenceAGCExecutable_WhenListingToyArchive_ThenOutputsAgree(t *testing.T) {
 	agcExe := os.Getenv("AGC_REFERENCE")
 	if agcExe == "" {
@@ -340,6 +511,28 @@ func TestArchive_GivenReferenceAGCExecutable_WhenListingToyArchive_ThenOutputsAg
 	if string(out) != wantCatalogue.String() {
 		t.Errorf("contig catalogue differs from reference CLI\ngot:\n%s\nwant:\n%s", wantCatalogue.String(), out)
 	}
+
+	for _, sample := range samples {
+		contigs, err := a.Contigs(sample)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, info := range contigs {
+			query := shortFixtureContigName(info.Name) + "@" + sample.Name
+			out, err := exec.Command(agcExe, "getctg", "-l", "0", path, query).Output()
+			if err != nil {
+				t.Fatalf("reference agc getctg %q: %v", query, err)
+			}
+			contig, err := a.Contig(sample, info.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ">" + contig.Name + "\n" + string(contig.Sequence) + "\n"
+			if string(out) != want {
+				t.Errorf("decoded %s differs from reference CLI\ngot: %q\nwant: %q", query, want, out)
+			}
+		}
+	}
 }
 
 func BenchmarkOpenToyArchive(b *testing.B) {
@@ -387,6 +580,55 @@ func BenchmarkListContigsToyArchive(b *testing.B) {
 	}
 }
 
+func BenchmarkRetrieveContigToyArchive(b *testing.B) {
+	data := toyArchive(b)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := a.Contig(agc.Sample{Name: "ref"}, "chr1"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkIterateAllToyArchive(b *testing.B) {
+	data := toyArchive(b)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := a.IterateAll(func(agc.Contig) error { return nil }); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func FuzzArchiveReader(f *testing.F) {
+	f.Add(toyArchive(f))
+	f.Add([]byte("not an AGC archive"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			return
+		}
+		defer a.Close()
+		samples, err := a.Samples()
+		if err != nil {
+			return
+		}
+		for _, sample := range samples {
+			_, _ = a.Contigs(sample)
+		}
+	})
+}
+
 func toyArchive(tb testing.TB) []byte {
 	tb.Helper()
 	encoded, err := os.ReadFile(filepath.Join("testdata", "toy_ex.agc.b64"))
@@ -398,6 +640,27 @@ func toyArchive(tb testing.TB) []byte {
 		tb.Fatal(err)
 	}
 	return data
+}
+
+func referenceAGC(tb testing.TB) string {
+	tb.Helper()
+	agcExe := os.Getenv("AGC_REFERENCE")
+	if agcExe != "" {
+		return agcExe
+	}
+	var err error
+	agcExe, err = exec.LookPath("agc")
+	if err != nil {
+		tb.Skip("set AGC_REFERENCE to cross-check against the reference executable")
+	}
+	return agcExe
+}
+
+func shortFixtureContigName(name string) string {
+	if i := strings.IndexAny(name, " \n\r\t"); i >= 0 {
+		return name[:i]
+	}
+	return name
 }
 
 type countingReaderAt struct {
