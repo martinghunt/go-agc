@@ -169,6 +169,104 @@ func TestArchive_GivenCorruptSampleBlockMetadata_WhenListing_ThenRejectsIt(t *te
 	}
 }
 
+func TestArchive_GivenUpstreamToyArchive_WhenListingContigs_ThenPreservesSampleAndContigIdentity(t *testing.T) {
+	a, err := agc.OpenReaderAt(bytes.NewReader(toyArchive(t)), int64(len(toyArchive(t))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		sample string
+		want   []string
+	}{
+		{"ref", []string{"chr1", "chr2", "chr3", "seq"}},
+		{"a", []string{"chr1a", "chr3a"}},
+		{"b", []string{"chr1", "g h i 21", "c", "t"}},
+		{"c", []string{"1", "2", "3"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.sample, func(t *testing.T) {
+			contigs, err := a.Contigs(agc.Sample{Name: tt.sample})
+			if err != nil {
+				t.Fatalf("Contigs() error = %v", err)
+			}
+			got := make([]string, len(contigs))
+			for i, contig := range contigs {
+				if contig.Sample.Name != tt.sample {
+					t.Errorf("contig %d sample = %q, want %q", i, contig.Sample.Name, tt.sample)
+				}
+				got[i] = contig.Name
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("contig names = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestArchive_GivenGeneratedNameDeltaAndMultipleBatches_WhenListingContigs_ThenDecodesLazily(t *testing.T) {
+	data := generatedV3ContigArchive(t)
+	r := &countingReaderAt{r: bytes.NewReader(data)}
+	a, err := agc.OpenReaderAt(r, int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := a.Contigs(agc.Sample{Name: "ref"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFirst := []agc.ContigInfo{
+		{Sample: agc.Sample{Name: "ref"}, Name: "alpha 001 x"},
+		{Sample: agc.Sample{Name: "ref"}, Name: "alpha 002 x"},
+		{Sample: agc.Sample{Name: "ref"}, Name: "literal"},
+	}
+	if !reflect.DeepEqual(first, wantFirst) {
+		t.Errorf("first batch contigs = %#v, want %#v", first, wantFirst)
+	}
+	afterFirst := r.bytesRead
+
+	// "same-batch" shares the already decoded part; no archive read is needed.
+	if _, err := a.Contigs(agc.Sample{Name: "same-batch"}); err != nil {
+		t.Fatal(err)
+	}
+	if r.bytesRead != afterFirst {
+		t.Errorf("same batch caused %d additional bytes to be read", r.bytesRead-afterFirst)
+	}
+
+	second, err := a.Contigs(agc.Sample{Name: "next-batch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []agc.ContigInfo{{Sample: agc.Sample{Name: "next-batch"}, Name: "alpha 001 x"}}; !reflect.DeepEqual(second, want) {
+		t.Errorf("second batch contigs = %#v, want %#v", second, want)
+	}
+	if r.bytesRead <= afterFirst {
+		t.Error("next batch did not lazily read another archive part")
+	}
+}
+
+func TestArchive_GivenUnknownSample_WhenListingContigs_ThenReturnsTypedError(t *testing.T) {
+	data := generatedV3ContigArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Contigs(agc.Sample{Name: "missing"}); !errors.Is(err, agc.ErrSampleNotFound) {
+		t.Fatalf("Contigs() error = %v, want ErrSampleNotFound", err)
+	}
+}
+
+func TestArchive_GivenCorruptContigNameDelta_WhenListingContigs_ThenRejectsIt(t *testing.T) {
+	data := generatedV3ContigArchiveWithDelta(t, []byte{0x80, ' ', 0x81, ' ', 0x81}) // repeat 128 bytes from a shorter prior component
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Contigs(agc.Sample{Name: "ref"}); !errors.Is(err, agc.ErrCorruptArchive) {
+		t.Fatalf("Contigs() error = %v, want ErrCorruptArchive", err)
+	}
+}
+
 func TestArchive_GivenReferenceAGCExecutable_WhenListingToyArchive_ThenOutputsAgree(t *testing.T) {
 	agcExe := os.Getenv("AGC_REFERENCE")
 	if agcExe == "" {
@@ -221,6 +319,27 @@ func TestArchive_GivenReferenceAGCExecutable_WhenListingToyArchive_ThenOutputsAg
 	if ref.Name != strings.TrimSpace(string(out)) {
 		t.Errorf("reference = %q, reference CLI = %q", ref.Name, strings.TrimSpace(string(out)))
 	}
+
+	args := []string{"listctg", path}
+	var wantCatalogue strings.Builder
+	for _, sample := range samples {
+		args = append(args, sample.Name)
+		fmt.Fprintln(&wantCatalogue, sample.Name)
+		contigs, err := a.Contigs(sample)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, contig := range contigs {
+			fmt.Fprintf(&wantCatalogue, "   %s\n", contig.Name)
+		}
+	}
+	out, err = exec.Command(agcExe, args...).Output()
+	if err != nil {
+		t.Fatalf("reference agc listctg: %v", err)
+	}
+	if string(out) != wantCatalogue.String() {
+		t.Errorf("contig catalogue differs from reference CLI\ngot:\n%s\nwant:\n%s", wantCatalogue.String(), out)
+	}
 }
 
 func BenchmarkOpenToyArchive(b *testing.B) {
@@ -245,6 +364,24 @@ func BenchmarkListSamplesToyArchive(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := a.Samples(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkListContigsToyArchive(b *testing.B) {
+	data := toyArchive(b)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := a.Contigs(agc.Sample{Name: "ref"}); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := a.Contigs(agc.Sample{Name: "ref"}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -276,6 +413,11 @@ type fixturePart struct {
 type fixtureStream struct {
 	name string
 	part fixturePart
+}
+
+type fixtureIndexedStream struct {
+	name  string
+	parts []fixturePart
 }
 
 func generatedV3Archive(tb testing.TB, minor uint32, sampleNames []string) []byte {
@@ -321,7 +463,89 @@ func generatedV3Archive(tb testing.TB, minor uint32, sampleNames []string) []byt
 	return archive
 }
 
+func generatedV3ContigArchive(tb testing.TB) []byte {
+	return generatedV3ContigArchiveWithDelta(tb, []byte{0x81, ' ', 0xfe, '2', ' ', 0x81})
+}
+
+func generatedV3ContigArchiveWithDelta(tb testing.TB, secondContigDelta []byte) []byte {
+	tb.Helper()
+	sampleNames := []string{"ref", "same-batch", "next-batch"}
+	fileInfo := appendCString(nil, "file_version_major")
+	fileInfo = appendCString(fileInfo, "3")
+	fileInfo = appendCString(fileInfo, "file_version_minor")
+	fileInfo = appendCString(fileInfo, "0")
+
+	collectionSamples := appendCollectionUint(nil, uint32(len(sampleNames)))
+	for _, name := range sampleNames {
+		collectionSamples = appendCString(collectionSamples, name)
+	}
+
+	// Batch zero has two samples. The second ref contig is the upstream v3
+	// delta representation of "alpha 002 x" relative to "alpha 001 x".
+	batch0 := appendCollectionUint(nil, 2)
+	batch0 = appendCollectionUint(batch0, 3)
+	batch0 = appendCString(batch0, "alpha 001 x")
+	batch0 = appendCStringBytes(batch0, secondContigDelta)
+	batch0 = appendCString(batch0, "literal")
+	batch0 = appendCollectionUint(batch0, 1)
+	batch0 = appendCString(batch0, "alpha 001 x")
+	batch1 := appendCollectionUint(nil, 1)
+	batch1 = appendCollectionUint(batch1, 1)
+	batch1 = appendCString(batch1, "alpha 001 x")
+
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	packedSamples := encoder.EncodeAll(collectionSamples, nil)
+	packedBatch0 := encoder.EncodeAll(batch0, nil)
+	packedBatch1 := encoder.EncodeAll(batch1, nil)
+	encoder.Close()
+
+	params := make([]byte, 16)
+	binary.LittleEndian.PutUint32(params[0:4], 31)
+	binary.LittleEndian.PutUint32(params[4:8], 20)
+	binary.LittleEndian.PutUint32(params[8:12], 2) // batch cardinality
+	binary.LittleEndian.PutUint32(params[12:16], 60_000)
+
+	var archive []byte
+	streams := make([]fixtureIndexedStream, 0, 4)
+	addStream := func(name string, dataParts [][]byte, metadata []uint64) {
+		stream := fixtureIndexedStream{name: name, parts: make([]fixturePart, 0, len(dataParts))}
+		for i, data := range dataParts {
+			offset := uint64(len(archive))
+			archive = appendArchiveUint(archive, metadata[i])
+			archive = append(archive, data...)
+			stream.parts = append(stream.parts, fixturePart{offset: offset, size: uint64(len(data))})
+		}
+		streams = append(streams, stream)
+	}
+	addStream("file_type_info", [][]byte{fileInfo}, []uint64{2})
+	addStream("collection-samples", [][]byte{packedSamples}, []uint64{uint64(len(collectionSamples))})
+	addStream("params", [][]byte{params}, []uint64{0})
+	addStream("collection-contigs", [][]byte{packedBatch0, packedBatch1}, []uint64{uint64(len(batch0)), uint64(len(batch1))})
+
+	var footer []byte
+	footer = appendArchiveUint(footer, uint64(len(streams)))
+	for _, stream := range streams {
+		footer = appendCString(footer, stream.name)
+		footer = appendArchiveUint(footer, uint64(len(stream.parts)))
+		footer = appendArchiveUint(footer, 0)
+		for _, part := range stream.parts {
+			footer = appendArchiveUint(footer, part.offset)
+			footer = appendArchiveUint(footer, part.size)
+		}
+	}
+	archive = append(archive, footer...)
+	return binary.LittleEndian.AppendUint64(archive, uint64(len(footer)))
+}
+
 func appendCString(dst []byte, value string) []byte {
+	dst = append(dst, value...)
+	return append(dst, 0)
+}
+
+func appendCStringBytes(dst, value []byte) []byte {
 	dst = append(dst, value...)
 	return append(dst, 0)
 }
