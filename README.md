@@ -3,6 +3,8 @@
 A pure-Go reader for [Assembled Genomes Compressor (AGC)](https://github.com/refresh-bio/agc)
 v3 archives.
 
+This repository was developed with substantial coding assistance from [OpenAI Codex](https://openai.com/codex), which helped with implementation, refactoring, tests, documentation, and benchmarking under human direction and review.
+
 The read-only library opens local files or arbitrary `io.ReaderAt` backends,
 validates file-format major version 3, lists samples and contigs, retrieves
 named contigs, and iterates one sample or the complete archive. Metadata and
