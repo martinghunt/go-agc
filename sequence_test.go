@@ -1,9 +1,12 @@
 package agc
 
 import (
+	"bytes"
 	"errors"
 	"reflect"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 func TestDecodeLZ_GivenV3Tokens_WhenDecoded_ThenReconstructsReferenceLiteralsMatchesAndNRuns(t *testing.T) {
@@ -56,4 +59,242 @@ func TestTuplesToBytes_GivenPackedDNA_WhenDecoded_ThenExpandsSymbols(t *testing.
 	if want := []byte{0, 1, 2, 3}; !reflect.DeepEqual(got, want) {
 		t.Errorf("tuplesToBytes() = %v, want %v", got, want)
 	}
+}
+
+func TestTuplesToBytes_GivenEveryV3PackingWidth_WhenDecoded_ThenExpandsSymbols(t *testing.T) {
+	tests := []struct {
+		name     string
+		tuples   []byte
+		expected []byte
+	}{
+		{"plain width", []byte{5, 4, 3, 0x10}, []byte{5, 4, 3}},
+		{"base16 width two", []byte{18, 3, 0x21}, []byte{1, 2, 3}},
+		{"base6 width three", []byte{51, 4, 0x31}, []byte{1, 2, 3, 4}},
+		{"base4 width four", []byte{27, 0, 0x40}, []byte{0, 1, 2, 3}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tuplesToBytes(tt.tuples, uint64(len(tt.expected)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Errorf("tuplesToBytes() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSegmentDecoder_GivenCompressedReferenceAndDelta_WhenDecoding_ThenUsesLZReferencePath(t *testing.T) {
+	reference := []byte{0, 1, 2, 3, 0, 1, 2, 3}
+	builder := newSegmentArchiveBuilder(t, 2, 3)
+	builder.addCompressed("xGr", append(append([]byte(nil), reference...), 0), uint64(len(reference)))
+	builder.addCompressed("xGd", append(append([]byte("0."), segmentSeparator), 0), 3)
+	decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+
+	got, err := decoder.decodeDelta(16, 1, uint32(len(reference)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, reference) {
+		t.Errorf("decodeDelta() = %v, want %v", got, reference)
+	}
+}
+
+func TestSegmentDecoder_GivenTuplePackedReference_WhenLoading_ThenExpandsIt(t *testing.T) {
+	builder := newSegmentArchiveBuilder(t, 2, 3)
+	// Tuple 27 is A,C,G,T in base 4; the zero is the no-trailing-symbol dummy.
+	builder.addCompressed("xGr", []byte{27, 0, 0x40, 1}, 4)
+	decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+
+	got, err := decoder.reference(16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{0, 1, 2, 3}; !reflect.DeepEqual(got, want) {
+		t.Errorf("reference() = %v, want %v", got, want)
+	}
+}
+
+func TestSegmentDecoder_GivenSecondRawAndDeltaPacks_WhenDecoding_ThenSelectsRequestedPart(t *testing.T) {
+	t.Run("raw group", func(t *testing.T) {
+		builder := newSegmentArchiveBuilder(t, 2, 3)
+		builder.addPlain("x0d", []byte{0, segmentSeparator, 1, segmentSeparator})
+		builder.addPlain("x0d", []byte{2, 3, segmentSeparator})
+		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		got, err := decoder.decodeRaw(0, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []byte{2, 3}; !reflect.DeepEqual(got, want) {
+			t.Errorf("decodeRaw() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("delta group", func(t *testing.T) {
+		reference := []byte{0, 1, 2, 3}
+		builder := newSegmentArchiveBuilder(t, 2, 3)
+		builder.addPlain("xGr", reference)
+		builder.addPlain("xGd", []byte{'A', segmentSeparator, 'B', segmentSeparator})
+		builder.addPlain("xGd", append([]byte("0."), segmentSeparator))
+		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		got, err := decoder.decodeDelta(16, 3, uint32(len(reference)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, reference) {
+			t.Errorf("decodeDelta() = %v, want %v", got, reference)
+		}
+	})
+}
+
+func TestReverseComplement_GivenCanonicalAndAmbiguousCodes_ThenMatchesAGCRules(t *testing.T) {
+	sequence := []byte{0, 1, 2, 3, 4, 15}
+	reverseComplement(sequence)
+	if want := []byte{15, 4, 0, 1, 2, 3}; !reflect.DeepEqual(sequence, want) {
+		t.Errorf("reverseComplement() = %v, want %v", sequence, want)
+	}
+}
+
+func TestSequencePrimitives_GivenMalformedData_WhenDecoded_ThenReturnCorruptionErrors(t *testing.T) {
+	t.Run("tuple encodings", func(t *testing.T) {
+		for _, tuples := range [][]byte{nil, {1, 0x50}, {1, 0x22}, {1, 0, 0x40}} {
+			if _, err := tuplesToBytes(tuples, 9); !errors.Is(err, ErrCorruptArchive) {
+				t.Errorf("tuplesToBytes(%v) error = %v", tuples, err)
+			}
+		}
+	})
+	t.Run("sequence pack indexes", func(t *testing.T) {
+		for _, index := range []int{-1, 2} {
+			if _, err := sequenceFromPack([]byte{1, segmentSeparator}, index); !errors.Is(err, ErrCorruptArchive) {
+				t.Errorf("sequenceFromPack(index %d) error = %v", index, err)
+			}
+		}
+	})
+	t.Run("zstd bounds and frame", func(t *testing.T) {
+		if _, err := decodeZstdAtMost(nil, 0, 10); !errors.Is(err, ErrCorruptArchive) {
+			t.Errorf("zero-bound decode error = %v", err)
+		}
+		if _, err := decodeZstdAtMost([]byte("bad frame"), 10, 10); !errors.Is(err, ErrCorruptArchive) {
+			t.Errorf("bad-frame decode error = %v", err)
+		}
+	})
+	t.Run("nucleotide alphabet", func(t *testing.T) {
+		if _, err := nucleotideText([]byte{16}); !errors.Is(err, ErrCorruptArchive) {
+			t.Errorf("nucleotideText() error = %v", err)
+		}
+	})
+	t.Run("decimal overflow", func(t *testing.T) {
+		if _, _, err := readDecimal([]byte("999999999999999999999"), 0); err == nil {
+			t.Error("readDecimal() accepted overflow")
+		}
+	})
+}
+
+func TestSegmentDecoder_GivenMalformedOrMismatchedParts_WhenDecoding_ThenRejectsThem(t *testing.T) {
+	t.Run("wrong decoded length", func(t *testing.T) {
+		builder := newSegmentArchiveBuilder(t, 2, 3)
+		builder.addPlain("x0d", []byte{0, segmentSeparator})
+		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		_, err := decoder.decode(segmentDescriptor{groupID: 0, rawLength: 2})
+		if !errors.Is(err, ErrCorruptArchive) {
+			t.Fatalf("decode() error = %v", err)
+		}
+	})
+	t.Run("invalid segment compression marker", func(t *testing.T) {
+		builder := newSegmentArchiveBuilder(t, 2, 3)
+		builder.addPart("x0d", []byte{1, 2, 9}, 2)
+		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		if _, err := decoder.decodeRaw(0, 0); !errors.Is(err, ErrCorruptArchive) {
+			t.Fatalf("decodeRaw() error = %v", err)
+		}
+	})
+	t.Run("invalid reference marker", func(t *testing.T) {
+		builder := newSegmentArchiveBuilder(t, 2, 3)
+		builder.addCompressed("xGr", []byte{0, 1, 2, 9}, 3)
+		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		if _, err := decoder.reference(16); !errors.Is(err, ErrCorruptArchive) {
+			t.Fatalf("reference() error = %v", err)
+		}
+	})
+}
+
+func FuzzDecodeLZ(f *testing.F) {
+	f.Add([]byte{0, 1, 2, 3}, []byte("0."), uint8(4))
+	f.Add([]byte{0, 1, 2, 3}, []byte{30, '2', 4}, uint8(6))
+	f.Add([]byte{0, 1, 2, 3}, []byte("-999,4."), uint8(8))
+	f.Fuzz(func(t *testing.T, reference, encoded []byte, size uint8) {
+		// Keep allocations bounded while exercising arbitrary token streams.
+		_, _ = decodeLZ(reference, encoded, 3, uint32(size))
+	})
+}
+
+func FuzzTuplesToBytes(f *testing.F) {
+	f.Add([]byte{27, 0, 0x40}, uint16(4))
+	f.Add([]byte{1, 0x50}, uint16(1))
+	f.Fuzz(func(t *testing.T, tuples []byte, expected uint16) {
+		_, _ = tuplesToBytes(tuples, uint64(expected))
+	})
+}
+
+type segmentArchiveBuilder struct {
+	t         *testing.T
+	data      []byte
+	streams   map[string]archiveStream
+	batchSize uint32
+	minMatch  uint32
+}
+
+func newSegmentArchiveBuilder(t *testing.T, batchSize, minMatch uint32) *segmentArchiveBuilder {
+	t.Helper()
+	return &segmentArchiveBuilder{t: t, streams: make(map[string]archiveStream), batchSize: batchSize, minMatch: minMatch}
+}
+
+func (b *segmentArchiveBuilder) addPlain(name string, data []byte) {
+	b.addPart(name, data, 0)
+}
+
+func (b *segmentArchiveBuilder) addCompressed(name string, rawWithMarker []byte, metadata uint64) {
+	b.t.Helper()
+	if len(rawWithMarker) == 0 {
+		b.t.Fatal("compressed test part needs a marker")
+	}
+	marker := rawWithMarker[len(rawWithMarker)-1]
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	packed := encoder.EncodeAll(rawWithMarker[:len(rawWithMarker)-1], nil)
+	encoder.Close()
+	packed = append(packed, marker)
+	b.addPart(name, packed, metadata)
+}
+
+func (b *segmentArchiveBuilder) addPart(name string, data []byte, metadata uint64) {
+	b.t.Helper()
+	offset := uint64(len(b.data))
+	b.data = appendTestArchiveUint(b.data, metadata)
+	b.data = append(b.data, data...)
+	stream := b.streams[name]
+	stream.parts = append(stream.parts, archivePart{offset: offset, size: uint64(len(data))})
+	b.streams[name] = stream
+}
+
+func (b *segmentArchiveBuilder) archive() *Archive {
+	return &Archive{
+		r: bytes.NewReader(b.data), index: archiveIndex{streams: b.streams, dataEnd: uint64(len(b.data))},
+		batchSize: b.batchSize, minMatchLen: b.minMatch,
+	}
+}
+
+func appendTestArchiveUint(dst []byte, value uint64) []byte {
+	n := 0
+	for x := value; x != 0; x >>= 8 {
+		n++
+	}
+	dst = append(dst, byte(n))
+	for shift := (n - 1) * 8; n != 0 && shift >= 0; shift -= 8 {
+		dst = append(dst, byte(value>>shift))
+	}
+	return dst
 }

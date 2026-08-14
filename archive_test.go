@@ -113,6 +113,75 @@ func TestArchive_GivenClosedArchive_WhenReading_ThenReturnsErrClosed(t *testing.
 	}
 }
 
+func TestArchive_GivenClosedArchive_WhenUsingEveryReadOperation_ThenReturnsErrClosed(t *testing.T) {
+	data := toyArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	checks := []struct {
+		name string
+		call func() error
+	}{
+		{"Contigs", func() error { _, err := a.Contigs(agc.Sample{Name: "ref"}); return err }},
+		{"Contig", func() error { _, err := a.Contig(agc.Sample{Name: "ref"}, "chr1"); return err }},
+		{"IterateSample", func() error { return a.IterateSample(agc.Sample{Name: "ref"}, func(agc.Contig) error { return nil }) }},
+		{"IterateAll", func() error { return a.IterateAll(func(agc.Contig) error { return nil }) }},
+	}
+	for _, check := range checks {
+		if err := check.call(); !errors.Is(err, agc.ErrClosed) {
+			t.Errorf("%s error = %v, want ErrClosed", check.name, err)
+		}
+	}
+}
+
+func TestArchive_GivenInvalidCallbacks_WhenIterating_ThenRejectsThem(t *testing.T) {
+	data := toyArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.IterateSample(agc.Sample{Name: "ref"}, nil); err == nil {
+		t.Error("IterateSample(nil) returned nil error")
+	}
+	if err := a.IterateAll(nil); err == nil {
+		t.Error("IterateAll(nil) returned nil error")
+	}
+}
+
+func TestArchive_GivenNoSamples_WhenIdentifyingReference_ThenRejectsArchive(t *testing.T) {
+	data := generatedV3Archive(t, 0, nil)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ReferenceSample(); !errors.Is(err, agc.ErrCorruptArchive) {
+		t.Fatalf("ReferenceSample() error = %v, want ErrCorruptArchive", err)
+	}
+}
+
+func TestArchive_GivenDuplicateOrEmptySampleIdentity_WhenListing_ThenRejectsIt(t *testing.T) {
+	for _, names := range [][]string{{"same", "same"}, {""}} {
+		data := generatedV3Archive(t, 0, names)
+		a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Samples(); !errors.Is(err, agc.ErrCorruptArchive) {
+			t.Errorf("Samples(%q) error = %v, want ErrCorruptArchive", names, err)
+		}
+	}
+}
+
+func TestOpen_GivenMissingPath_ThenReturnsFilesystemError(t *testing.T) {
+	if _, err := agc.Open(filepath.Join(t.TempDir(), "missing.agc")); err == nil {
+		t.Fatal("Open() returned nil error")
+	}
+}
+
 func TestOpenReaderAt_GivenUnsupportedMajorVersion_ThenRejectsIt(t *testing.T) {
 	data := toyArchive(t)
 	old := []byte("file_version_major\x003\x00")
@@ -122,6 +191,58 @@ func TestOpenReaderAt_GivenUnsupportedMajorVersion_ThenRejectsIt(t *testing.T) {
 	_, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
 	if !errors.Is(err, agc.ErrUnsupportedVersion) {
 		t.Fatalf("OpenReaderAt() error = %v, want ErrUnsupportedVersion", err)
+	}
+}
+
+func TestOpenReaderAt_GivenMalformedVersionFields_ThenRejectsThem(t *testing.T) {
+	tests := []struct {
+		name, old, replacement string
+	}{
+		{"invalid major", "file_version_major\x003\x00", "file_version_major\x00x\x00"},
+		{"invalid minor", "file_version_minor\x000\x00", "file_version_minor\x00x\x00"},
+		{"missing minor", "file_version_minor\x00", "file_version_minoX\x00"},
+		{"duplicate key", "file_version_minor\x00", "file_version_major\x00"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := toyArchive(t)
+			data = bytes.Replace(data, []byte(tt.old), []byte(tt.replacement), 1)
+			_, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+			if !errors.Is(err, agc.ErrCorruptArchive) {
+				t.Fatalf("OpenReaderAt() error = %v, want ErrCorruptArchive", err)
+			}
+		})
+	}
+}
+
+func TestArchive_GivenInvalidOrMissingParams_WhenListingContigs_ThenRejectsIt(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{"missing params", func(data []byte) []byte {
+			return bytes.Replace(data, []byte("params\x00"), []byte("paramX\x00"), 1)
+		}},
+		{"zero batch size", func(data []byte) []byte {
+			params := []byte{31, 0, 0, 0, 20, 0, 0, 0, 2, 0, 0, 0}
+			replacement := append([]byte(nil), params...)
+			for i := 8; i < 12; i++ {
+				replacement[i] = 0
+			}
+			return bytes.Replace(data, params, replacement, 1)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := tt.mutate(generatedV3ContigArchive(t))
+			a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := a.Contigs(agc.Sample{Name: "ref"}); !errors.Is(err, agc.ErrCorruptArchive) {
+				t.Fatalf("Contigs() error = %v, want ErrCorruptArchive", err)
+			}
+		})
 	}
 }
 
