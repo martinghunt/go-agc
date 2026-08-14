@@ -1,0 +1,51 @@
+name: test
+
+on:
+  pull_request:
+    paths-ignore:
+      - README.md
+      - RELEASING.md
+      - CHANGELOG.md
+      - docs/**
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - README.md
+      - RELEASING.md
+      - CHANGELOG.md
+      - docs/**
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run race tests
+        run: go test -race ./...
+
+      - name: Verify pure-Go build
+        env:
+          CGO_ENABLED: "0"
+        run: go test ./...
+

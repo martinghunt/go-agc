@@ -26,3 +26,9 @@ The implementation is read-only and lazily reads indexed archive parts. It
 uses `github.com/klauspost/compress/zstd` and does not require cgo or the AGC
 executable. Tests include the upstream toy archive, generated v3 fixtures,
 corruption cases, optional reference-CLI cross-checks, and benchmarks.
+
+## Releases
+
+This is a library-only Go module, so releases are semantic-version Git tags;
+there are no executable artifacts to build. See [RELEASING.md](RELEASING.md)
+for the tagging workflow and consumer installation command.
