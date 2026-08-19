@@ -53,24 +53,26 @@ type Contig struct {
 
 // Archive is an open, read-only AGC v3 archive.
 type Archive struct {
-	mu             sync.Mutex
-	r              io.ReaderAt
-	size           int64
-	index          archiveIndex
-	version        Version
-	closer         io.Closer
-	closed         bool
-	samples        []Sample
-	sampleIDs      map[string]int
-	batchSize      uint32
-	kmerLength     uint32
-	minMatchLen    uint32
-	segmentSize    uint32
-	paramsLoaded   bool
-	contigBatchID  int
-	contigBatch    [][]string
-	detailsBatchID int
-	contigDetails  [][][]segmentDescriptor
+	mu                  sync.Mutex
+	r                   io.ReaderAt
+	size                int64
+	index               archiveIndex
+	version             Version
+	closer              io.Closer
+	closed              bool
+	samples             []Sample
+	sampleIDs           map[string]int
+	batchSize           uint32
+	kmerLength          uint32
+	minMatchLen         uint32
+	segmentSize         uint32
+	paramsLoaded        bool
+	contigBatchID       int
+	contigBatch         [][]string
+	detailsBatchID      int
+	contigDetails       [][][]segmentDescriptor
+	namedContigSampleID int
+	namedContigIDs      map[string]int
 }
 
 // Open opens a local AGC v3 archive. Close releases the underlying file.
@@ -106,7 +108,10 @@ func openReaderAt(r io.ReaderAt, size int64, closer io.Closer) (*Archive, error)
 	if err != nil {
 		return nil, err
 	}
-	a := &Archive{r: r, size: size, index: index, closer: closer, contigBatchID: -1, detailsBatchID: -1}
+	a := &Archive{
+		r: r, size: size, index: index, closer: closer,
+		contigBatchID: -1, detailsBatchID: -1, namedContigSampleID: -1,
+	}
 	version, err := a.readVersion()
 	if err != nil {
 		return nil, err

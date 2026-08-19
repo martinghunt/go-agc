@@ -48,18 +48,30 @@ func (a *Archive) Contig(sample Sample, name string) (Contig, error) {
 		return Contig{}, err
 	}
 	withinBatch := sampleID - batchID*int(a.batchSize)
-	query := shortContigName(name)
-	contigID := -1
-	for i, stored := range a.contigBatch[withinBatch] {
-		if shortContigName(stored) == query {
-			contigID = i
-			break
-		}
-	}
+	contigID := a.namedContigID(sampleID, a.contigBatch[withinBatch], name)
 	if contigID < 0 {
 		return Contig{}, fmt.Errorf("%w: %q in sample %q", ErrContigNotFound, name, sample.Name)
 	}
 	return a.decodeContigLocked(sampleID, withinBatch, contigID)
+}
+
+func (a *Archive) namedContigID(sampleID int, names []string, name string) int {
+	if a.namedContigSampleID != sampleID {
+		ids := make(map[string]int, len(names))
+		for i, stored := range names {
+			short := shortContigName(stored)
+			if _, exists := ids[short]; !exists {
+				ids[short] = i
+			}
+		}
+		a.namedContigSampleID = sampleID
+		a.namedContigIDs = ids
+	}
+	id, ok := a.namedContigIDs[shortContigName(name)]
+	if !ok {
+		return -1
+	}
+	return id
 }
 
 func (a *Archive) decodeContigLocked(sampleID, withinBatch, contigID int) (Contig, error) {

@@ -34,6 +34,29 @@ func TestDecodeLZ_GivenV3Tokens_WhenDecoded_ThenReconstructsReferenceLiteralsMat
 	}
 }
 
+func TestNamedContigID_GivenRepeatedLookups_WhenResolvingNames_ThenCachesOneSampleAndKeepsFirstShortName(t *testing.T) {
+	a := &Archive{namedContigSampleID: -1}
+	names := []string{"alpha first", "alpha second", "beta description"}
+
+	if got := a.namedContigID(4, names, "alpha"); got != 0 {
+		t.Fatalf("namedContigID(alpha) = %d, want first matching index 0", got)
+	}
+	if got := a.namedContigID(4, names, "beta"); got != 2 {
+		t.Fatalf("namedContigID(beta) = %d, want 2", got)
+	}
+	if a.namedContigSampleID != 4 || len(a.namedContigIDs) != 2 {
+		t.Fatalf("cached lookup = sample %d with %d names, want sample 4 with 2 names", a.namedContigSampleID, len(a.namedContigIDs))
+	}
+
+	otherNames := []string{"gamma description"}
+	if got := a.namedContigID(9, otherNames, "gamma"); got != 0 {
+		t.Fatalf("namedContigID(gamma) = %d, want 0", got)
+	}
+	if got := a.namedContigID(9, otherNames, "alpha"); got != -1 {
+		t.Fatalf("namedContigID(alpha) after changing sample = %d, want -1", got)
+	}
+}
+
 func TestDecodeLZ_GivenCorruptTokens_WhenDecoded_ThenReturnsCorruptArchive(t *testing.T) {
 	tests := [][]byte{
 		[]byte("99."),
