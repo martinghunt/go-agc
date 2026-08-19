@@ -59,38 +59,55 @@ func (a *Archive) ReferenceSample() (Sample, error) {
 func (a *Archive) Contigs(sample Sample) ([]ContigInfo, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.closed {
-		return nil, ErrClosed
-	}
-	if a.samples == nil {
-		if err := a.loadSamples(); err != nil {
-			return nil, err
-		}
-	}
-	sampleID, ok := a.sampleIDs[sample.Name]
-	if !ok {
-		return nil, fmt.Errorf("%w: %q", ErrSampleNotFound, sample.Name)
-	}
-	if err := a.loadParams(); err != nil {
+	sampleID, names, err := a.contigNamesLocked(sample)
+	if err != nil {
 		return nil, err
 	}
-	batchID := sampleID / int(a.batchSize)
-	if a.contigBatchID != batchID {
-		if err := a.loadContigBatch(batchID); err != nil {
-			return nil, err
-		}
-	}
-	withinBatch := sampleID - batchID*int(a.batchSize)
-	if withinBatch < 0 || withinBatch >= len(a.contigBatch) {
-		return nil, fmt.Errorf("%w: sample %q missing from contig batch", ErrCorruptArchive, sample.Name)
-	}
-	names := a.contigBatch[withinBatch]
 	contigs := make([]ContigInfo, len(names))
 	canonicalSample := a.samples[sampleID]
 	for i, name := range names {
 		contigs[i] = ContigInfo{Sample: canonicalSample, Name: name}
 	}
 	return contigs, nil
+}
+
+func (a *Archive) contigCount(sample Sample) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, names, err := a.contigNamesLocked(sample)
+	if err != nil {
+		return 0, err
+	}
+	return len(names), nil
+}
+
+func (a *Archive) contigNamesLocked(sample Sample) (int, []string, error) {
+	if a.closed {
+		return 0, nil, ErrClosed
+	}
+	if a.samples == nil {
+		if err := a.loadSamples(); err != nil {
+			return 0, nil, err
+		}
+	}
+	sampleID, ok := a.sampleIDs[sample.Name]
+	if !ok {
+		return 0, nil, fmt.Errorf("%w: %q", ErrSampleNotFound, sample.Name)
+	}
+	if err := a.loadParams(); err != nil {
+		return 0, nil, err
+	}
+	batchID := sampleID / int(a.batchSize)
+	if a.contigBatchID != batchID {
+		if err := a.loadContigBatch(batchID); err != nil {
+			return 0, nil, err
+		}
+	}
+	withinBatch := sampleID - batchID*int(a.batchSize)
+	if withinBatch < 0 || withinBatch >= len(a.contigBatch) {
+		return 0, nil, fmt.Errorf("%w: sample %q missing from contig batch", ErrCorruptArchive, sample.Name)
+	}
+	return sampleID, a.contigBatch[withinBatch], nil
 }
 
 func (a *Archive) loadSamples() error {

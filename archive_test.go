@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -459,6 +460,61 @@ func TestArchive_GivenSample_WhenIterating_ThenYieldsContigsInArchiveOrder(t *te
 	}
 }
 
+func TestContigReader_GivenSample_WhenReadToEnd_ThenYieldsContigsInArchiveOrder(t *testing.T) {
+	data := toyArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := a.NewContigReader(agc.Sample{Name: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	for {
+		contig, err := r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, contig.Sample.Name+"/"+contig.Name+"="+string(contig.Sequence))
+	}
+	want := []string{"b/chr1=AAAAAAAAA", "b/g h i 21=GGGAGGG", "b/c=CCCCCCCCC", "b/t=TTTTTTT"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ContigReader = %#v, want %#v", got, want)
+	}
+	if _, err := r.Read(); !errors.Is(err, io.EOF) {
+		t.Errorf("Read() after EOF error = %v, want io.EOF", err)
+	}
+}
+
+func TestNewContigReader_GivenUnavailableSampleOrClosedArchive_WhenOpened_ThenReturnsTypedError(t *testing.T) {
+	data := toyArchive(t)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.NewContigReader(agc.Sample{Name: "missing"}); !errors.Is(err, agc.ErrSampleNotFound) {
+		t.Errorf("NewContigReader(missing) error = %v, want ErrSampleNotFound", err)
+	}
+	r, err := a.NewContigReader(agc.Sample{Name: "ref"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Read(); !errors.Is(err, agc.ErrClosed) {
+		t.Errorf("Read() after archive close error = %v, want ErrClosed", err)
+	}
+	if _, err := a.NewContigReader(agc.Sample{Name: "ref"}); !errors.Is(err, agc.ErrClosed) {
+		t.Errorf("NewContigReader(closed) error = %v, want ErrClosed", err)
+	}
+}
+
 func TestArchive_GivenAllSamples_WhenIterating_ThenYieldsArchiveOrderAndCanStop(t *testing.T) {
 	data := toyArchive(t)
 	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
@@ -712,6 +768,30 @@ func BenchmarkRetrieveContigToyArchive(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		if _, err := a.Contig(agc.Sample{Name: "ref"}, "chr1"); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReadSampleToyArchive(b *testing.B) {
+	data := toyArchive(b)
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		b.Fatal(err)
+	}
+	sample := agc.Sample{Name: "b"}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r, err := a.NewContigReader(sample)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for {
+			if _, err := r.Read(); errors.Is(err, io.EOF) {
+				break
+			} else if err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
 }

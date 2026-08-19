@@ -21,6 +21,19 @@ defer archive.Close()
 samples, err := archive.Samples()
 reference, err := archive.ReferenceSample()
 contigs, err := archive.Contigs(reference)
+
+reader, err := archive.NewContigReader(reference)
+for {
+	contig, err := reader.Read()
+	if errors.Is(err, io.EOF) {
+		break
+	}
+	if err != nil {
+		return err
+	}
+	consume(contig.Name, contig.Sequence)
+}
+
 err = archive.IterateSample(reference, func(contig agc.Contig) error {
 	return consume(contig.Name, contig.Sequence)
 })
