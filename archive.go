@@ -73,8 +73,8 @@ type Archive struct {
 	contigDetails       [][][]segmentDescriptor
 	namedContigSampleID int
 	namedContigIDs      map[string]int
-	referenceCache      *boundedByteCache[uint32]
-	packCache           *boundedByteCache[segmentPackKey]
+	referenceCache      *boundedCache[uint32, []byte]
+	packCache           *boundedCache[segmentPackKey, [][]byte]
 }
 
 // Open opens a local AGC v3 archive. Close releases the underlying file.
@@ -113,8 +113,8 @@ func openReaderAt(r io.ReaderAt, size int64, closer io.Closer) (*Archive, error)
 	a := &Archive{
 		r: r, size: size, index: index, closer: closer,
 		contigBatchID: -1, detailsBatchID: -1, namedContigSampleID: -1,
-		referenceCache: newBoundedByteCache[uint32](maxSegmentCacheBytes),
-		packCache:      newBoundedByteCache[segmentPackKey](maxSegmentCacheBytes),
+		referenceCache: newBoundedCache[uint32, []byte](maxSegmentCacheBytes),
+		packCache:      newBoundedCache[segmentPackKey, [][]byte](maxSegmentCacheBytes),
 	}
 	version, err := a.readVersion()
 	if err != nil {

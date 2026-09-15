@@ -6,6 +6,7 @@ package agc
 // third_party/agc.LICENSE.
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"strings"
@@ -22,35 +23,42 @@ const (
 	maxSegmentCacheBytes = 256 << 20
 )
 
-// boundedByteCache holds decoded segment data behind a byte budget, evicting
-// the oldest entries first once the budget is exceeded.
-type boundedByteCache[K comparable] struct {
+// boundedCache holds decoded segment data behind a byte budget, evicting the
+// oldest entries first once the budget is exceeded. size is the caller's
+// accounting cost for value (e.g. the underlying backing array's length),
+// since a cached value need not be a []byte itself.
+type boundedCache[K comparable, V any] struct {
 	maxBytes int
 	bytes    int
 	order    []K
-	entries  map[K][]byte
+	entries  map[K]cacheEntry[V]
 }
 
-func newBoundedByteCache[K comparable](maxBytes int) *boundedByteCache[K] {
-	return &boundedByteCache[K]{maxBytes: maxBytes, entries: make(map[K][]byte)}
+type cacheEntry[V any] struct {
+	value V
+	size  int
 }
 
-func (c *boundedByteCache[K]) get(key K) ([]byte, bool) {
-	value, ok := c.entries[key]
-	return value, ok
+func newBoundedCache[K comparable, V any](maxBytes int) *boundedCache[K, V] {
+	return &boundedCache[K, V]{maxBytes: maxBytes, entries: make(map[K]cacheEntry[V])}
 }
 
-func (c *boundedByteCache[K]) put(key K, value []byte) {
+func (c *boundedCache[K, V]) get(key K) (V, bool) {
+	entry, ok := c.entries[key]
+	return entry.value, ok
+}
+
+func (c *boundedCache[K, V]) put(key K, value V, size int) {
 	if _, exists := c.entries[key]; exists {
 		return
 	}
-	c.entries[key] = value
+	c.entries[key] = cacheEntry[V]{value: value, size: size}
 	c.order = append(c.order, key)
-	c.bytes += len(value)
+	c.bytes += size
 	for c.bytes > c.maxBytes && len(c.order) > 1 {
 		oldest := c.order[0]
 		c.order = c.order[1:]
-		c.bytes -= len(c.entries[oldest])
+		c.bytes -= c.entries[oldest].size
 		delete(c.entries, oldest)
 	}
 }
@@ -210,17 +218,11 @@ func (d *segmentDecoder) decode(descriptor segmentDescriptor) ([]byte, error) {
 func (d *segmentDecoder) decodeRaw(groupID, sequenceID uint32) ([]byte, error) {
 	packSize := d.archive.batchSize
 	partID := int(sequenceID / packSize)
-	key := segmentPackKey{group: groupID, part: partID}
-	pack, ok := d.archive.packCache.get(key)
-	if !ok {
-		var err error
-		pack, err = d.readPackedStream(segmentStreamName(groupID, 'd'), partID)
-		if err != nil {
-			return nil, err
-		}
-		d.archive.packCache.put(key, pack)
+	parts, err := d.loadPack(groupID, partID)
+	if err != nil {
+		return nil, err
 	}
-	return sequenceFromPack(pack, int(sequenceID%packSize))
+	return sequenceAt(parts, int(sequenceID%packSize))
 }
 
 func (d *segmentDecoder) decodeDelta(groupID, sequenceID, expectedSize uint32) ([]byte, error) {
@@ -233,20 +235,31 @@ func (d *segmentDecoder) decodeDelta(groupID, sequenceID, expectedSize uint32) (
 	}
 	packSize := d.archive.batchSize
 	partID := int((sequenceID - 1) / packSize)
-	key := segmentPackKey{group: groupID, part: partID}
-	pack, ok := d.archive.packCache.get(key)
-	if !ok {
-		pack, err = d.readPackedStream(segmentStreamName(groupID, 'd'), partID)
-		if err != nil {
-			return nil, err
-		}
-		d.archive.packCache.put(key, pack)
+	parts, err := d.loadPack(groupID, partID)
+	if err != nil {
+		return nil, err
 	}
-	delta, err := sequenceFromPack(pack, int((sequenceID-1)%packSize))
+	delta, err := sequenceAt(parts, int((sequenceID-1)%packSize))
 	if err != nil {
 		return nil, err
 	}
 	return decodeLZ(reference, delta, d.archive.minMatchLen, expectedSize)
+}
+
+// loadPack returns a delta-pack's sequences, split once and cached, rather
+// than rescanning the whole pack from byte zero on every lookup.
+func (d *segmentDecoder) loadPack(groupID uint32, partID int) ([][]byte, error) {
+	key := segmentPackKey{group: groupID, part: partID}
+	if parts, ok := d.archive.packCache.get(key); ok {
+		return parts, nil
+	}
+	raw, err := d.readPackedStream(segmentStreamName(groupID, 'd'), partID)
+	if err != nil {
+		return nil, err
+	}
+	parts := splitSegmentPack(raw)
+	d.archive.packCache.put(key, parts, len(raw))
+	return parts, nil
 }
 
 func (d *segmentDecoder) reference(groupID uint32) ([]byte, error) {
@@ -288,7 +301,7 @@ func (d *segmentDecoder) reference(groupID uint32) ([]byte, error) {
 			return nil, fmt.Errorf("%w: reference length %d, want %d", ErrCorruptArchive, len(reference), rawSize)
 		}
 	}
-	d.archive.referenceCache.put(groupID, reference)
+	d.archive.referenceCache.put(groupID, reference, len(reference))
 	return reference, nil
 }
 
@@ -310,23 +323,22 @@ func (d *segmentDecoder) readPackedStream(name string, partID int) ([]byte, erro
 	return decodeZstdBlock(packed[:len(packed)-1], rawSize, maxSequenceBlockSize)
 }
 
-func sequenceFromPack(pack []byte, index int) ([]byte, error) {
-	if index < 0 {
-		return nil, fmt.Errorf("%w: negative sequence pack index", ErrCorruptArchive)
+// splitSegmentPack splits a segment pack into its separator-terminated
+// sequences once, so repeated lookups by index don't rescan the pack from
+// the start every time. bytes.Split's final element is whatever follows the
+// last separator (empty when the pack is properly terminated, a truncated
+// leftover otherwise); dropping it matches the wire format, where a sequence
+// only exists once its terminating separator has been seen.
+func splitSegmentPack(pack []byte) [][]byte {
+	parts := bytes.Split(pack, []byte{segmentSeparator})
+	return parts[:len(parts)-1]
+}
+
+func sequenceAt(parts [][]byte, index int) ([]byte, error) {
+	if index < 0 || index >= len(parts) {
+		return nil, fmt.Errorf("%w: sequence %d missing from segment pack", ErrCorruptArchive, index)
 	}
-	start := 0
-	current := 0
-	for i, b := range pack {
-		if b != segmentSeparator {
-			continue
-		}
-		if current == index {
-			return append([]byte(nil), pack[start:i]...), nil
-		}
-		current++
-		start = i + 1
-	}
-	return nil, fmt.Errorf("%w: sequence %d missing from segment pack", ErrCorruptArchive, index)
+	return append([]byte(nil), parts[index]...), nil
 }
 
 func segmentStreamName(groupID uint32, suffix byte) string {

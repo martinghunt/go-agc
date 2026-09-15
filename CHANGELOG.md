@@ -10,11 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Cache decompressed reference and delta segment packs at the archive level, bounded to a fixed byte budget with oldest-first eviction, so repeated `Contig`/`IterateSample`/`IterateAll` calls that share reference groups no longer re-fetch and re-decompress the same data.
 
+### Changed
+- Split a cached delta pack into its sequences once instead of rescanning it from the start on every lookup, so a contig with many segments in the same pack no longer costs quadratic time.
+- Document the project's development assistance from Claude Code alongside OpenAI Codex.
+
 ### Fixed
 - Cap sample count and per-sample contig count independently of decompressed stream size, so a small malicious archive can no longer force multi-gigabyte slice/map preallocation before any entry is validated.
-
-### Changed
-- Document the project's development assistance from Claude Code alongside OpenAI Codex.
 
 ## [0.2.0] - 2026-08-19
 

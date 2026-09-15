@@ -171,6 +171,33 @@ func TestSegmentDecoder_GivenSecondRawAndDeltaPacks_WhenDecoding_ThenSelectsRequ
 	})
 }
 
+func TestSplitSegmentPack_GivenTerminatedAndTruncatedPacks_ThenIndexesOnlyCompletedSequences(t *testing.T) {
+	tests := []struct {
+		name string
+		pack []byte
+		want [][]byte
+	}{
+		{"empty pack has no sequences", nil, [][]byte{}},
+		{"properly terminated", []byte{0, segmentSeparator, 1, segmentSeparator}, [][]byte{{0}, {1}}},
+		{"empty sequence", []byte{segmentSeparator}, [][]byte{{}}},
+		{"trailing data without a terminator is not a sequence", []byte{0, segmentSeparator, 1}, [][]byte{{0}}},
+		{"no terminator at all", []byte{1, 2, 3}, [][]byte{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitSegmentPack(tt.pack)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitSegmentPack(%v) = %v, want %v", tt.pack, got, tt.want)
+			}
+			for i := range got {
+				if !reflect.DeepEqual(got[i], tt.want[i]) {
+					t.Errorf("splitSegmentPack(%v)[%d] = %v, want %v", tt.pack, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestReverseComplement_GivenCanonicalAndAmbiguousCodes_ThenMatchesAGCRules(t *testing.T) {
 	sequence := []byte{0, 1, 2, 3, 4, 15}
 	reverseComplement(sequence)
@@ -188,9 +215,10 @@ func TestSequencePrimitives_GivenMalformedData_WhenDecoded_ThenReturnCorruptionE
 		}
 	})
 	t.Run("sequence pack indexes", func(t *testing.T) {
-		for _, index := range []int{-1, 2} {
-			if _, err := sequenceFromPack([]byte{1, segmentSeparator}, index); !errors.Is(err, ErrCorruptArchive) {
-				t.Errorf("sequenceFromPack(index %d) error = %v", index, err)
+		parts := splitSegmentPack([]byte{1, segmentSeparator})
+		for _, index := range []int{-1, 1} {
+			if _, err := sequenceAt(parts, index); !errors.Is(err, ErrCorruptArchive) {
+				t.Errorf("sequenceAt(index %d) error = %v", index, err)
 			}
 		}
 	})
@@ -307,8 +335,8 @@ func (b *segmentArchiveBuilder) archive() *Archive {
 	return &Archive{
 		r: bytes.NewReader(b.data), index: archiveIndex{streams: b.streams, dataEnd: uint64(len(b.data))},
 		batchSize: b.batchSize, minMatchLen: b.minMatch,
-		referenceCache: newBoundedByteCache[uint32](maxSegmentCacheBytes),
-		packCache:      newBoundedByteCache[segmentPackKey](maxSegmentCacheBytes),
+		referenceCache: newBoundedCache[uint32, []byte](maxSegmentCacheBytes),
+		packCache:      newBoundedCache[segmentPackKey, [][]byte](maxSegmentCacheBytes),
 	}
 }
 
