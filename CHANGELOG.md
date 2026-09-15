@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Document the project's development assistance from Claude Code alongside OpenAI Codex.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added
