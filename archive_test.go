@@ -291,6 +291,41 @@ func TestArchive_GivenCorruptSampleBlockMetadata_WhenListing_ThenRejectsIt(t *te
 	}
 }
 
+func TestArchive_GivenSampleCountAboveCap_WhenListing_ThenRejectsWithoutOversizedAllocation(t *testing.T) {
+	const overCap = 1<<20 + 1 // one over collection.go's maxSamples
+	raw := appendCollectionUint(nil, uint32(overCap))
+	raw = append(raw, make([]byte, overCap)...) // satisfies the size-only bound so only the count cap can reject this
+
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packed := encoder.EncodeAll(raw, nil)
+	encoder.Close()
+
+	data := archiveWithSamplesStream(t, packed, uint64(len(raw)))
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("OpenReaderAt() error = %v", err)
+	}
+	if _, err := a.Samples(); !errors.Is(err, agc.ErrCorruptArchive) {
+		t.Fatalf("Samples() error = %v, want ErrCorruptArchive", err)
+	}
+}
+
+func TestArchive_GivenContigCountAboveCap_WhenListingContigs_ThenRejectsWithoutOversizedAllocation(t *testing.T) {
+	const overCap = 1<<24 + 1 // one over collection.go's maxContigsPerSample
+	data := generatedV3ContigArchiveWithOversizedContigCount(t, overCap)
+
+	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("OpenReaderAt() error = %v", err)
+	}
+	if _, err := a.Contigs(agc.Sample{Name: "only"}); !errors.Is(err, agc.ErrCorruptArchive) {
+		t.Fatalf("Contigs() error = %v, want ErrCorruptArchive", err)
+	}
+}
+
 func TestArchive_GivenUpstreamToyArchive_WhenListingContigs_ThenPreservesSampleAndContigIdentity(t *testing.T) {
 	a, err := agc.OpenReaderAt(bytes.NewReader(toyArchive(t)), int64(len(toyArchive(t))))
 	if err != nil {
@@ -988,6 +1023,107 @@ func generatedV3ContigArchiveWithDelta(tb testing.TB, secondContigDelta []byte) 
 	addStream("collection-samples", [][]byte{packedSamples}, []uint64{uint64(len(collectionSamples))})
 	addStream("params", [][]byte{params}, []uint64{0})
 	addStream("collection-contigs", [][]byte{packedBatch0, packedBatch1}, []uint64{uint64(len(batch0)), uint64(len(batch1))})
+
+	var footer []byte
+	footer = appendArchiveUint(footer, uint64(len(streams)))
+	for _, stream := range streams {
+		footer = appendCString(footer, stream.name)
+		footer = appendArchiveUint(footer, uint64(len(stream.parts)))
+		footer = appendArchiveUint(footer, 0)
+		for _, part := range stream.parts {
+			footer = appendArchiveUint(footer, part.offset)
+			footer = appendArchiveUint(footer, part.size)
+		}
+	}
+	archive = append(archive, footer...)
+	return binary.LittleEndian.AppendUint64(archive, uint64(len(footer)))
+}
+
+// archiveWithSamplesStream builds a minimal v3 archive whose collection-samples
+// stream is exactly the caller-supplied packed bytes, so tests can assert on
+// declared counts that disagree with the actual sample list.
+func archiveWithSamplesStream(tb testing.TB, packedSamples []byte, rawSize uint64) []byte {
+	tb.Helper()
+	fileInfo := appendCString(nil, "file_version_major")
+	fileInfo = appendCString(fileInfo, "3")
+	fileInfo = appendCString(fileInfo, "file_version_minor")
+	fileInfo = appendCString(fileInfo, "0")
+
+	var archive []byte
+	streams := make([]fixtureStream, 0, 2)
+	addPart := func(name string, data []byte, metadata uint64) {
+		offset := uint64(len(archive))
+		archive = appendArchiveUint(archive, metadata)
+		archive = append(archive, data...)
+		streams = append(streams, fixtureStream{name: name, part: fixturePart{offset: offset, size: uint64(len(data))}})
+	}
+	addPart("file_type_info", fileInfo, 2)
+	addPart("collection-samples", packedSamples, rawSize)
+
+	var footer []byte
+	footer = appendArchiveUint(footer, uint64(len(streams)))
+	for _, stream := range streams {
+		footer = appendCString(footer, stream.name)
+		footer = appendArchiveUint(footer, 1) // parts
+		footer = appendArchiveUint(footer, 0) // aggregate raw size is informational
+		footer = appendArchiveUint(footer, stream.part.offset)
+		footer = appendArchiveUint(footer, stream.part.size)
+	}
+	archive = append(archive, footer...)
+	return binary.LittleEndian.AppendUint64(archive, uint64(len(footer)))
+}
+
+// generatedV3ContigArchiveWithOversizedContigCount builds a one-sample, one-batch
+// v3 archive whose collection-contigs batch declares contigCount for its only
+// sample, followed by enough padding that the size-only bound alone would
+// accept it.
+func generatedV3ContigArchiveWithOversizedContigCount(tb testing.TB, contigCount uint32) []byte {
+	tb.Helper()
+	sampleNames := []string{"only"}
+	fileInfo := appendCString(nil, "file_version_major")
+	fileInfo = appendCString(fileInfo, "3")
+	fileInfo = appendCString(fileInfo, "file_version_minor")
+	fileInfo = appendCString(fileInfo, "0")
+
+	collectionSamples := appendCollectionUint(nil, uint32(len(sampleNames)))
+	for _, name := range sampleNames {
+		collectionSamples = appendCString(collectionSamples, name)
+	}
+
+	batch0 := appendCollectionUint(nil, uint32(len(sampleNames)))
+	batch0 = appendCollectionUint(batch0, contigCount)
+	batch0 = append(batch0, make([]byte, contigCount)...)
+
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	packedSamples := encoder.EncodeAll(collectionSamples, nil)
+	packedBatch0 := encoder.EncodeAll(batch0, nil)
+	encoder.Close()
+
+	params := make([]byte, 16)
+	binary.LittleEndian.PutUint32(params[0:4], 31)
+	binary.LittleEndian.PutUint32(params[4:8], 20)
+	binary.LittleEndian.PutUint32(params[8:12], uint32(len(sampleNames))) // batch cardinality
+	binary.LittleEndian.PutUint32(params[12:16], 60_000)
+
+	var archive []byte
+	streams := make([]fixtureIndexedStream, 0, 4)
+	addStream := func(name string, dataParts [][]byte, metadata []uint64) {
+		stream := fixtureIndexedStream{name: name, parts: make([]fixturePart, 0, len(dataParts))}
+		for i, data := range dataParts {
+			offset := uint64(len(archive))
+			archive = appendArchiveUint(archive, metadata[i])
+			archive = append(archive, data...)
+			stream.parts = append(stream.parts, fixturePart{offset: offset, size: uint64(len(data))})
+		}
+		streams = append(streams, stream)
+	}
+	addStream("file_type_info", [][]byte{fileInfo}, []uint64{2})
+	addStream("collection-samples", [][]byte{packedSamples}, []uint64{uint64(len(collectionSamples))})
+	addStream("params", [][]byte{params}, []uint64{0})
+	addStream("collection-contigs", [][]byte{packedBatch0}, []uint64{uint64(len(batch0))})
 
 	var footer []byte
 	footer = appendArchiveUint(footer, uint64(len(streams)))

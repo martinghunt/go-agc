@@ -18,6 +18,12 @@ const (
 	maxDetailsBatchSize   = 256 << 20
 	maxParamsSize         = 64
 	maxSegmentsPerBatch   = 1 << 24
+	// maxSamples and maxContigsPerSample bound slice and map preallocation
+	// independently of decompressed stream size: each entry is only a few
+	// bytes in the wire format but 16+ bytes once allocated, so a size-only
+	// bound lets a small compressed stream force a multi-gigabyte allocation.
+	maxSamples          = 1 << 20
+	maxContigsPerSample = 1 << 24
 )
 
 type segmentDescriptor struct {
@@ -128,7 +134,7 @@ func (a *Archive) loadSamples() error {
 	}
 	c := byteCursor{data: raw}
 	count, err := c.collectionUint()
-	if err != nil || uint64(count) > uint64(len(raw)) {
+	if err != nil || uint64(count) > uint64(len(raw)) || count > maxSamples {
 		return fmt.Errorf("%w: invalid sample count", ErrCorruptArchive)
 	}
 	samples := make([]Sample, 0, count)
@@ -214,7 +220,7 @@ func (a *Archive) loadContigBatch(batchID int) error {
 	batch := make([][]string, int(count))
 	for i := range batch {
 		contigCount, err := c.collectionUint()
-		if err != nil || uint64(contigCount) > uint64(c.remaining()) {
+		if err != nil || uint64(contigCount) > uint64(c.remaining()) || contigCount > maxContigsPerSample {
 			return fmt.Errorf("%w: invalid contig count in batch %d sample %d", ErrCorruptArchive, batchID, i)
 		}
 		batch[i] = make([]string, int(contigCount))

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Cap sample count and per-sample contig count independently of decompressed stream size, so a small malicious archive can no longer force multi-gigabyte slice/map preallocation before any entry is validated.
+
 ### Changed
 - Document the project's development assistance from Claude Code alongside OpenAI Codex.
 
