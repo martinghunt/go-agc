@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Cache decompressed reference and delta segment packs at the archive level, bounded to a fixed byte budget with oldest-first eviction, so repeated `Contig`/`IterateSample`/`IterateAll` calls that share reference groups no longer re-fetch and re-decompress the same data.
+
 ### Fixed
 - Cap sample count and per-sample contig count independently of decompressed stream size, so a small malicious archive can no longer force multi-gigabyte slice/map preallocation before any entry is validated.
 

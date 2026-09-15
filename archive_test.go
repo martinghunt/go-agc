@@ -464,6 +464,26 @@ func TestArchive_GivenUpstreamToyArchive_WhenRetrievingNamedContigs_ThenDecodesS
 	}
 }
 
+func TestArchive_GivenRepeatedContigRetrieval_WhenDecoding_ThenReusesCachedSegmentData(t *testing.T) {
+	data := toyArchive(t)
+	r := &countingReaderAt{r: bytes.NewReader(data)}
+	a, err := agc.OpenReaderAt(r, int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Contig(agc.Sample{Name: "ref"}, "chr1"); err != nil {
+		t.Fatalf("Contig() error = %v", err)
+	}
+	afterFirst := r.bytesRead
+
+	if _, err := a.Contig(agc.Sample{Name: "ref"}, "chr1"); err != nil {
+		t.Fatalf("Contig() error = %v", err)
+	}
+	if r.bytesRead != afterFirst {
+		t.Errorf("decoding an already-decoded contig again read %d additional bytes, want 0: segment packs and references should be cached across Contig calls", r.bytesRead-afterFirst)
+	}
+}
+
 func TestArchive_GivenMissingContig_WhenRetrieving_ThenReturnsTypedError(t *testing.T) {
 	data := toyArchive(t)
 	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))

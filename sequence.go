@@ -15,7 +15,45 @@ const (
 	rawSegmentGroups     = 16
 	maxSequenceBlockSize = 1 << 30
 	segmentSeparator     = 0xff
+	// maxSegmentCacheBytes bounds each of the archive's reference and delta
+	// pack caches, so repeated Contig calls reuse already-decompressed
+	// segment data (the common case: many contigs share a small set of
+	// reference groups) without retaining the whole archive in memory.
+	maxSegmentCacheBytes = 256 << 20
 )
+
+// boundedByteCache holds decoded segment data behind a byte budget, evicting
+// the oldest entries first once the budget is exceeded.
+type boundedByteCache[K comparable] struct {
+	maxBytes int
+	bytes    int
+	order    []K
+	entries  map[K][]byte
+}
+
+func newBoundedByteCache[K comparable](maxBytes int) *boundedByteCache[K] {
+	return &boundedByteCache[K]{maxBytes: maxBytes, entries: make(map[K][]byte)}
+}
+
+func (c *boundedByteCache[K]) get(key K) ([]byte, bool) {
+	value, ok := c.entries[key]
+	return value, ok
+}
+
+func (c *boundedByteCache[K]) put(key K, value []byte) {
+	if _, exists := c.entries[key]; exists {
+		return
+	}
+	c.entries[key] = value
+	c.order = append(c.order, key)
+	c.bytes += len(value)
+	for c.bytes > c.maxBytes && len(c.order) > 1 {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		c.bytes -= len(c.entries[oldest])
+		delete(c.entries, oldest)
+	}
+}
 
 // Contig retrieves and decodes a named contig from a sample. Name matching
 // follows AGC: the query and stored header are compared up to the first ASCII
@@ -75,7 +113,7 @@ func (a *Archive) namedContigID(sampleID int, names []string, name string) int {
 }
 
 func (a *Archive) decodeContigLocked(sampleID, withinBatch, contigID int) (Contig, error) {
-	decoder := segmentDecoder{archive: a, references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+	decoder := segmentDecoder{archive: a}
 	descriptors := a.contigDetails[withinBatch][contigID]
 	var numeric []byte
 	for i, descriptor := range descriptors {
@@ -149,9 +187,7 @@ type segmentPackKey struct {
 }
 
 type segmentDecoder struct {
-	archive    *Archive
-	references map[uint32][]byte
-	packs      map[segmentPackKey][]byte
+	archive *Archive
 }
 
 func (d *segmentDecoder) decode(descriptor segmentDescriptor) ([]byte, error) {
@@ -175,14 +211,14 @@ func (d *segmentDecoder) decodeRaw(groupID, sequenceID uint32) ([]byte, error) {
 	packSize := d.archive.batchSize
 	partID := int(sequenceID / packSize)
 	key := segmentPackKey{group: groupID, part: partID}
-	pack, ok := d.packs[key]
+	pack, ok := d.archive.packCache.get(key)
 	if !ok {
 		var err error
 		pack, err = d.readPackedStream(segmentStreamName(groupID, 'd'), partID)
 		if err != nil {
 			return nil, err
 		}
-		d.packs[key] = pack
+		d.archive.packCache.put(key, pack)
 	}
 	return sequenceFromPack(pack, int(sequenceID%packSize))
 }
@@ -198,13 +234,13 @@ func (d *segmentDecoder) decodeDelta(groupID, sequenceID, expectedSize uint32) (
 	packSize := d.archive.batchSize
 	partID := int((sequenceID - 1) / packSize)
 	key := segmentPackKey{group: groupID, part: partID}
-	pack, ok := d.packs[key]
+	pack, ok := d.archive.packCache.get(key)
 	if !ok {
 		pack, err = d.readPackedStream(segmentStreamName(groupID, 'd'), partID)
 		if err != nil {
 			return nil, err
 		}
-		d.packs[key] = pack
+		d.archive.packCache.put(key, pack)
 	}
 	delta, err := sequenceFromPack(pack, int((sequenceID-1)%packSize))
 	if err != nil {
@@ -214,7 +250,7 @@ func (d *segmentDecoder) decodeDelta(groupID, sequenceID, expectedSize uint32) (
 }
 
 func (d *segmentDecoder) reference(groupID uint32) ([]byte, error) {
-	if reference, ok := d.references[groupID]; ok {
+	if reference, ok := d.archive.referenceCache.get(groupID); ok {
 		return reference, nil
 	}
 	part, err := d.archive.index.part(segmentStreamName(groupID, 'r'), 0)
@@ -252,7 +288,7 @@ func (d *segmentDecoder) reference(groupID uint32) ([]byte, error) {
 			return nil, fmt.Errorf("%w: reference length %d, want %d", ErrCorruptArchive, len(reference), rawSize)
 		}
 	}
-	d.references[groupID] = reference
+	d.archive.referenceCache.put(groupID, reference)
 	return reference, nil
 }
 

@@ -113,7 +113,7 @@ func TestSegmentDecoder_GivenCompressedReferenceAndDelta_WhenDecoding_ThenUsesLZ
 	builder := newSegmentArchiveBuilder(t, 2, 3)
 	builder.addCompressed("xGr", append(append([]byte(nil), reference...), 0), uint64(len(reference)))
 	builder.addCompressed("xGd", append(append([]byte("0."), segmentSeparator), 0), 3)
-	decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+	decoder := segmentDecoder{archive: builder.archive()}
 
 	got, err := decoder.decodeDelta(16, 1, uint32(len(reference)))
 	if err != nil {
@@ -128,7 +128,7 @@ func TestSegmentDecoder_GivenTuplePackedReference_WhenLoading_ThenExpandsIt(t *t
 	builder := newSegmentArchiveBuilder(t, 2, 3)
 	// Tuple 27 is A,C,G,T in base 4; the zero is the no-trailing-symbol dummy.
 	builder.addCompressed("xGr", []byte{27, 0, 0x40, 1}, 4)
-	decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+	decoder := segmentDecoder{archive: builder.archive()}
 
 	got, err := decoder.reference(16)
 	if err != nil {
@@ -144,7 +144,7 @@ func TestSegmentDecoder_GivenSecondRawAndDeltaPacks_WhenDecoding_ThenSelectsRequ
 		builder := newSegmentArchiveBuilder(t, 2, 3)
 		builder.addPlain("x0d", []byte{0, segmentSeparator, 1, segmentSeparator})
 		builder.addPlain("x0d", []byte{2, 3, segmentSeparator})
-		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		decoder := segmentDecoder{archive: builder.archive()}
 		got, err := decoder.decodeRaw(0, 2)
 		if err != nil {
 			t.Fatal(err)
@@ -160,7 +160,7 @@ func TestSegmentDecoder_GivenSecondRawAndDeltaPacks_WhenDecoding_ThenSelectsRequ
 		builder.addPlain("xGr", reference)
 		builder.addPlain("xGd", []byte{'A', segmentSeparator, 'B', segmentSeparator})
 		builder.addPlain("xGd", append([]byte("0."), segmentSeparator))
-		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		decoder := segmentDecoder{archive: builder.archive()}
 		got, err := decoder.decodeDelta(16, 3, uint32(len(reference)))
 		if err != nil {
 			t.Fatal(err)
@@ -218,7 +218,7 @@ func TestSegmentDecoder_GivenMalformedOrMismatchedParts_WhenDecoding_ThenRejects
 	t.Run("wrong decoded length", func(t *testing.T) {
 		builder := newSegmentArchiveBuilder(t, 2, 3)
 		builder.addPlain("x0d", []byte{0, segmentSeparator})
-		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		decoder := segmentDecoder{archive: builder.archive()}
 		_, err := decoder.decode(segmentDescriptor{groupID: 0, rawLength: 2})
 		if !errors.Is(err, ErrCorruptArchive) {
 			t.Fatalf("decode() error = %v", err)
@@ -227,7 +227,7 @@ func TestSegmentDecoder_GivenMalformedOrMismatchedParts_WhenDecoding_ThenRejects
 	t.Run("invalid segment compression marker", func(t *testing.T) {
 		builder := newSegmentArchiveBuilder(t, 2, 3)
 		builder.addPart("x0d", []byte{1, 2, 9}, 2)
-		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		decoder := segmentDecoder{archive: builder.archive()}
 		if _, err := decoder.decodeRaw(0, 0); !errors.Is(err, ErrCorruptArchive) {
 			t.Fatalf("decodeRaw() error = %v", err)
 		}
@@ -235,7 +235,7 @@ func TestSegmentDecoder_GivenMalformedOrMismatchedParts_WhenDecoding_ThenRejects
 	t.Run("invalid reference marker", func(t *testing.T) {
 		builder := newSegmentArchiveBuilder(t, 2, 3)
 		builder.addCompressed("xGr", []byte{0, 1, 2, 9}, 3)
-		decoder := segmentDecoder{archive: builder.archive(), references: make(map[uint32][]byte), packs: make(map[segmentPackKey][]byte)}
+		decoder := segmentDecoder{archive: builder.archive()}
 		if _, err := decoder.reference(16); !errors.Is(err, ErrCorruptArchive) {
 			t.Fatalf("reference() error = %v", err)
 		}
@@ -307,6 +307,8 @@ func (b *segmentArchiveBuilder) archive() *Archive {
 	return &Archive{
 		r: bytes.NewReader(b.data), index: archiveIndex{streams: b.streams, dataEnd: uint64(len(b.data))},
 		batchSize: b.batchSize, minMatchLen: b.minMatch,
+		referenceCache: newBoundedByteCache[uint32](maxSegmentCacheBytes),
+		packCache:      newBoundedByteCache[segmentPackKey](maxSegmentCacheBytes),
 	}
 }
 
