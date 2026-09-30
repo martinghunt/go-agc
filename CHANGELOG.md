@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add `OpenURL` and configurable `OpenURLWithOptions` for reading AGC v3 archives from HTTP byte-range servers, with strong-ETag pinning, bounded read-ahead caching, concurrent range fetching, and sample-aware coalescing of nearby reference and delta parts.
+
+### Changed
+- Prefetch and deduplicate the compressed parts needed by remote sample iteration, downloading small or densely requested objects in full, while leaving local files and ordinary `io.ReaderAt` inputs on the existing demand-driven path.
+
 ## [0.3.0] - 2026-09-17
 
 ### Added

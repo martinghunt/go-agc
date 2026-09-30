@@ -21,6 +21,9 @@ func (a *Archive) NewContigReader(sample Sample) (*ContigReader, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := a.prefetchSample(sample); err != nil {
+		return nil, err
+	}
 	return &ContigReader{archive: a, sample: sample, count: count}, nil
 }
 

@@ -98,6 +98,9 @@ func (a *Archive) Contig(sample Sample, name string) (Contig, error) {
 	if contigID < 0 {
 		return Contig{}, fmt.Errorf("%w: %q in sample %q", ErrContigNotFound, name, sample.Name)
 	}
+	if err := a.prefetchDescriptorsLocked(a.contigDetails[withinBatch][contigID]); err != nil {
+		return Contig{}, err
+	}
 	return a.decodeContigLocked(sampleID, withinBatch, contigID)
 }
 
@@ -146,6 +149,101 @@ func (a *Archive) decodeContigLocked(sampleID, withinBatch, contigID int) (Conti
 		return Contig{}, err
 	}
 	return Contig{Sample: a.samples[sampleID], Name: a.contigBatch[withinBatch][contigID], Sequence: sequence}, nil
+}
+
+func (a *Archive) prefetchSample(sample Sample) error {
+	prefetcher, ok := a.r.(rangePrefetcher)
+	if !ok {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return ErrClosed
+	}
+	if a.samples == nil {
+		if err := a.loadSamples(); err != nil {
+			return err
+		}
+	}
+	sampleID, ok := a.sampleIDs[sample.Name]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrSampleNotFound, sample.Name)
+	}
+	if err := a.loadParams(); err != nil {
+		return err
+	}
+	batchID := sampleID / int(a.batchSize)
+	if a.contigBatchID != batchID {
+		if err := a.loadContigBatch(batchID); err != nil {
+			return err
+		}
+	}
+	if err := a.loadContigDetails(batchID); err != nil {
+		return err
+	}
+	withinBatch := sampleID - batchID*int(a.batchSize)
+	var descriptors []segmentDescriptor
+	for _, contig := range a.contigDetails[withinBatch] {
+		descriptors = append(descriptors, contig...)
+	}
+	return a.prefetchDescriptorsWithLocked(prefetcher, descriptors)
+}
+
+func (a *Archive) prefetchDescriptorsLocked(descriptors []segmentDescriptor) error {
+	prefetcher, ok := a.r.(rangePrefetcher)
+	if !ok {
+		return nil
+	}
+	return a.prefetchDescriptorsWithLocked(prefetcher, descriptors)
+}
+
+func (a *Archive) prefetchDescriptorsWithLocked(prefetcher rangePrefetcher, descriptors []segmentDescriptor) error {
+	ranges := make(map[readRange]struct{}, len(descriptors)*2)
+	addPart := func(stream string, partID int) error {
+		part, err := a.index.part(stream, partID)
+		if err != nil {
+			return err
+		}
+		if part.size == 0 {
+			return nil
+		}
+		available := a.index.dataEnd - part.offset
+		length := part.size
+		if available-length > 9 {
+			length += 9
+		} else {
+			length = available
+		}
+		ranges[readRange{offset: int64(part.offset), length: int64(length)}] = struct{}{}
+		return nil
+	}
+	for _, descriptor := range descriptors {
+		if descriptor.groupID < rawSegmentGroups {
+			partID := int(descriptor.inGroupID / a.batchSize)
+			if err := addPart(segmentStreamName(descriptor.groupID, 'd'), partID); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := addPart(segmentStreamName(descriptor.groupID, 'r'), 0); err != nil {
+			return err
+		}
+		if descriptor.inGroupID != 0 {
+			partID := int((descriptor.inGroupID - 1) / a.batchSize)
+			if err := addPart(segmentStreamName(descriptor.groupID, 'd'), partID); err != nil {
+				return err
+			}
+		}
+	}
+	requests := make([]readRange, 0, len(ranges))
+	for requestRange := range ranges {
+		requests = append(requests, requestRange)
+	}
+	if err := prefetcher.Prefetch(requests); err != nil {
+		return fmt.Errorf("agc: prefetch remote sequence data: %w", err)
+	}
+	return nil
 }
 
 func (a *Archive) contigAt(sample Sample, contigID int) (Contig, error) {

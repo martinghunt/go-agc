@@ -515,6 +515,26 @@ func TestArchive_GivenSample_WhenIterating_ThenYieldsContigsInArchiveOrder(t *te
 	}
 }
 
+func TestNewContigReader_GivenOrdinaryReaderAt_WhenCreated_ThenLeavesSequenceReadsLazy(t *testing.T) {
+	data := toyArchive(t)
+	underlying := &countingReaderAt{r: bytes.NewReader(data)}
+	a, err := agc.OpenReaderAt(underlying, int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := a.NewContigReader(agc.Sample{Name: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterCreate := underlying.bytesRead
+	if _, err := r.Read(); err != nil {
+		t.Fatal(err)
+	}
+	if underlying.bytesRead <= afterCreate {
+		t.Fatal("ordinary ReaderAt eagerly read sequence parts during NewContigReader")
+	}
+}
+
 func TestContigReader_GivenSample_WhenReadToEnd_ThenYieldsContigsInArchiveOrder(t *testing.T) {
 	data := toyArchive(t)
 	a, err := agc.OpenReaderAt(bytes.NewReader(data), int64(len(data)))

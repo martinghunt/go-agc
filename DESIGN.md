@@ -22,6 +22,8 @@ type Contig struct {
 
 func Open(path string) (*Archive, error)
 func OpenReaderAt(r io.ReaderAt, size int64) (*Archive, error)
+func OpenURL(ctx context.Context, url string, client *http.Client) (*Archive, error)
+func OpenURLWithOptions(ctx context.Context, url string, options HTTPOptions) (*Archive, error)
 func (a *Archive) Close() error
 func (a *Archive) Samples() ([]Sample, error)
 func (a *Archive) ReferenceSample() (Sample, error)
@@ -38,6 +40,18 @@ The callback iterators avoid forcing all decoded sequence data into memory and a
 ## Internal shape
 
 The footer is parsed into a small immutable stream/part index. Parts are fetched with `io.ReaderAt`, validating the metadata prefix and all bounds. Collection sample names are cached after first use. Contig-name/detail batches and segment packs will use bounded caches rather than whole-archive prefetching.
+
+`OpenURL` supplies a range-backed `io.ReaderAt`. It additionally implements an
+internal prefetch capability used only by remote archives: sequence descriptors
+are resolved to archive parts, duplicate parts are removed, nearby ranges are
+merged up to a bounded size, and independent requests are fetched concurrently.
+The default policy downloads objects no larger than 16 MiB in full. For larger
+range-backed objects, it also switches to a full request when one sample's
+planned ranges cover at least 80% and the object fits the 64 MiB cache. All
+range, cache, concurrency, and whole-object thresholds are configurable through
+`HTTPOptions`.
+Local files and arbitrary `OpenReaderAt` implementations retain demand-driven
+reads and do not enter the prefetch path.
 
 ## Phases
 
