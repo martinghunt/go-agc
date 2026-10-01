@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-01
+
 ### Added
 - Add `OpenURL` and configurable `OpenURLWithOptions` for reading AGC v3 archives from HTTP byte-range servers, with strong-ETag pinning, bounded read-ahead caching, concurrent range fetching, and sample-aware coalescing of nearby reference and delta parts.
 
@@ -39,7 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Release `v0.1.0`, before changelog tracking started in this file.
 
-[Unreleased]: https://github.com/martinghunt/go-agc/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/martinghunt/go-agc/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/martinghunt/go-agc/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/martinghunt/go-agc/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/martinghunt/go-agc/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/martinghunt/go-agc/releases/tag/v0.1.0
